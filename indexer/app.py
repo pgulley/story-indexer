@@ -20,9 +20,6 @@ from indexer import sentry
 
 Labels = List[Tuple[str, Any]]  # optional labels/values for a statistic report
 
-# format for stderr:
-FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-
 LEVEL_DEST = "log_level"  # args entry name!
 LEVELS = [level.lower() for level in logging._nameToLevel.keys()]
 LOGGER_LEVEL_SEP = ":"
@@ -37,9 +34,10 @@ class AppException(RuntimeError):
     """
 
 
-class ArgsProtocol(Protocol):
+class AppProtocol(Protocol):
     """
-    class for "self" in App mixins that declare & access command line args
+    base class for App mixins that declare & access command line args,
+    or want to report stats
     """
 
     args: Optional[argparse.Namespace]
@@ -47,14 +45,53 @@ class ArgsProtocol(Protocol):
     def define_options(self, ap: argparse.ArgumentParser) -> None:
         ...
 
+    def process_args(self) -> None:
+        ...
 
-class App(ArgsProtocol):
+    def incr(self, name: str, value: int = 1, labels: Labels = []) -> None:
+        ...
+
+    def gauge(self, name: str, value: float, labels: Labels = []) -> None:
+        ...
+
+    def timing(self, name: str, ms: float, labels: Labels = []) -> None:
+        ...
+
+    def timer(self, name: str) -> "_TimingContext":
+        ...
+
+
+# Dicts of log formats, indexed by App.LOG_FORMAT
+
+# see https://docs.python.org/3/library/logging.html#logrecord-attributes
+# for options in log formats.
+
+# formats for stderr
+STDERR_FORMATS = {
+    "normal": "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    "thread": "%(asctime)s | %(levelname)s | %(name)s | %(threadName)s | %(message)s",
+}
+
+# look like syslog messages (except date format),
+# adds levelname; does NOT include logger name, or pid:
+SYSLOG_FORMATS = {
+    "normal": "%(asctime)s %(hostname)s %(app)s %(levelname)s: %(message)s",
+    # include thread, formatted as if syslog pid
+    "thread": "%(asctime)s %(hostname)s %(app)s[%(threadName)s] %(levelname)s: %(message)s",
+}
+
+
+class App(AppProtocol):
     """
     Base class for command line applications (ie; Worker)
     """
 
+    LOG_FORMAT = "normal"
+
     def __init__(self, process_name: str, descr: str):
-        self.process_name = process_name
+        # override of process_name allow alternate versions of pipeline
+        # (ie; processing historical data) from different queues
+        self.process_name = os.environ.get("PROCESS_NAME", process_name)
         self.descr = descr
         self.args: Optional[argparse.Namespace] = None  # set by main
         self._statsd: Optional[statsd.StatsdClient] = None
@@ -141,7 +178,7 @@ class App(ArgsProtocol):
         # both stderr handler created by basicConfig.
         # _COULD_ apply to just stderr *handler* and
         # send everything to syslog handler.
-        logging.basicConfig(format=FORMAT, level=level)
+        logging.basicConfig(format=STDERR_FORMATS[self.LOG_FORMAT], level=level)
 
         if self.args.logger_level:
             for ll in self.args.logger_level:
@@ -168,9 +205,7 @@ class App(ArgsProtocol):
                 "hostname": socket.gethostname(),  # without domain
                 "app": self.process_name,
             }
-            # look like syslog messages (except date format),
-            # adds levelname; does NOT include logger name, or pid:
-            fmt = "%(asctime)s %(hostname)s %(app)s %(levelname)s: %(message)s"
+            fmt = SYSLOG_FORMATS[self.LOG_FORMAT]
 
             # Might like default datefmt includes milliseconds
             # (which aren't otherwise available)
@@ -363,7 +398,7 @@ class _TimingContext:
         self.t0 = -1.0
 
 
-class IntervalMixin(ArgsProtocol):
+class IntervalMixin(AppProtocol):
     """
     Mixin for Apps that report stats at a fixed interval
     """
@@ -389,11 +424,23 @@ class IntervalMixin(ArgsProtocol):
         time.sleep(sleep_sec)
 
 
+def run(klass: type[App], *args: Any, **kw: Any) -> None:
+    """
+    run app process
+    """
+    app = klass(*args, **kw)
+    app.main()
+
+
 if __name__ == "__main__":
 
     class Test(App):
         def main_loop(self) -> None:
-            print("here")
+            # allow testing of --help, --debug, --log-level
+            logger.critical("critical")
+            logger.error("error")
+            logger.warning("warning")
+            logger.info("info")
+            logger.debug("debug")
 
-    t = Test("test", "test of app class")
-    t.main()
+    run(Test, "test", "test of app class")
